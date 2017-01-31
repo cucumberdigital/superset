@@ -1,15 +1,16 @@
 /* eslint camelcase: 0 */
 const $ = window.$ = require('jquery');
 const FAVESTAR_BASE_URL = '/superset/favstar/slice';
-
-export const SET_FIELD_OPTIONS = 'SET_FIELD_OPTIONS';
-export function setFieldOptions(options) {
-  return { type: SET_FIELD_OPTIONS, options };
-}
+import { getExploreUrl } from '../exploreUtils';
 
 export const SET_DATASOURCE_TYPE = 'SET_DATASOURCE_TYPE';
 export function setDatasourceType(datasourceType) {
   return { type: SET_DATASOURCE_TYPE, datasourceType };
+}
+
+export const SET_DATASOURCE = 'SET_DATASOURCE';
+export function setDatasource(datasource) {
+  return { type: SET_DATASOURCE, datasource };
 }
 
 export const FETCH_STARTED = 'FETCH_STARTED';
@@ -27,7 +28,7 @@ export function fetchFailed(error) {
   return { type: FETCH_FAILED, error };
 }
 
-export function fetchFieldOptions(datasourceId, datasourceType) {
+export function fetchDatasourceMetadata(datasourceId, datasourceType) {
   return function (dispatch) {
     dispatch(fetchStarted());
 
@@ -38,7 +39,7 @@ export function fetchFieldOptions(datasourceId, datasourceType) {
         type: 'GET',
         url,
         success: (data) => {
-          dispatch(setFieldOptions(data.field_options));
+          dispatch(setDatasource(data));
           dispatch(fetchSucceeded());
         },
         error(error) {
@@ -78,24 +79,9 @@ export function saveFaveStar(sliceId, isStarred) {
   };
 }
 
-export const ADD_FILTER = 'ADD_FILTER';
-export function addFilter(filter) {
-  return { type: ADD_FILTER, filter };
-}
-
-export const REMOVE_FILTER = 'REMOVE_FILTER';
-export function removeFilter(filter) {
-  return { type: REMOVE_FILTER, filter };
-}
-
-export const CHANGE_FILTER = 'CHANGE_FILTER';
-export function changeFilter(filter, field, value) {
-  return { type: CHANGE_FILTER, filter, field, value };
-}
-
 export const SET_FIELD_VALUE = 'SET_FIELD_VALUE';
-export function setFieldValue(datasource_type, key, value, label) {
-  return { type: SET_FIELD_VALUE, datasource_type, key, value, label };
+export function setFieldValue(fieldName, value, validationErrors) {
+  return { type: SET_FIELD_VALUE, fieldName, value, validationErrors };
 }
 
 export const CHART_UPDATE_STARTED = 'CHART_UPDATE_STARTED';
@@ -104,13 +90,18 @@ export function chartUpdateStarted() {
 }
 
 export const CHART_UPDATE_SUCCEEDED = 'CHART_UPDATE_SUCCEEDED';
-export function chartUpdateSucceeded(query) {
-  return { type: CHART_UPDATE_SUCCEEDED, query };
+export function chartUpdateSucceeded(queryResponse) {
+  return { type: CHART_UPDATE_SUCCEEDED, queryResponse };
 }
 
 export const CHART_UPDATE_FAILED = 'CHART_UPDATE_FAILED';
-export function chartUpdateFailed(error) {
-  return { type: CHART_UPDATE_FAILED, error };
+export function chartUpdateFailed(queryResponse) {
+  return { type: CHART_UPDATE_FAILED, queryResponse };
+}
+
+export const CHART_RENDERING_FAILED = 'CHART_RENDERING_FAILED';
+export function chartRenderingFailed(error) {
+  return { type: CHART_RENDERING_FAILED, error };
 }
 
 export const UPDATE_EXPLORE_ENDPOINTS = 'UPDATE_EXPLORE_ENDPOINTS';
@@ -181,4 +172,17 @@ export function saveSlice(url) {
 export const UPDATE_CHART_STATUS = 'UPDATE_CHART_STATUS';
 export function updateChartStatus(status) {
   return { type: UPDATE_CHART_STATUS, status };
+}
+
+export const RUN_QUERY = 'RUN_QUERY';
+export function runQuery(formData, datasourceType) {
+  return function (dispatch) {
+    dispatch(updateChartStatus('loading'));
+    const url = getExploreUrl(formData, datasourceType, 'json');
+    $.getJSON(url, function (queryResponse) {
+      dispatch(chartUpdateSucceeded(queryResponse));
+    }).fail(function (err) {
+      dispatch(chartUpdateFailed(err));
+    });
+  };
 }

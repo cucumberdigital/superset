@@ -6,6 +6,7 @@ from __future__ import unicode_literals
 from datetime import datetime, timedelta
 import json
 import logging
+import pandas as pd
 import pickle
 import re
 import sys
@@ -17,11 +18,11 @@ import functools
 import sqlalchemy as sqla
 
 from flask import (
-    g, request, redirect, flash, Response, render_template, Markup)
+    g, request, redirect, flash, Response, render_template, Markup, url_for)
 from flask_appbuilder import ModelView, CompactCRUDMixin, BaseView, expose
 from flask_appbuilder.actions import action
 from flask_appbuilder.models.sqla.interface import SQLAInterface
-from flask_appbuilder.security.decorators import has_access, has_access_api
+from flask_appbuilder.security.decorators import has_access_api
 from flask_appbuilder.widgets import ListWidget
 from flask_appbuilder.models.sqla.filters import BaseFilter
 from flask_appbuilder.security.sqla import models as ab_models
@@ -35,11 +36,13 @@ from wtforms.validators import ValidationError
 
 import superset
 from superset import (
-    appbuilder, cache, db, models, viz, utils, app,
-    sm, sql_lab, sql_parse, results_backend, security,
+    app, appbuilder, cache, db, models, sm, sql_lab, sql_parse,
+    results_backend, security, viz, utils,
 )
+from superset.utils import has_access
 from superset.source_registry import SourceRegistry
 from superset.models import DatasourceAccessRequest as DAR
+from superset.sql_parse import SupersetQuery
 
 config = app.config
 log_this = models.Log.log_this
@@ -48,30 +51,34 @@ QueryStatus = models.QueryStatus
 
 
 class BaseSupersetView(BaseView):
-    def can_access(self, permission_name, view_name):
-        return utils.can_access(appbuilder.sm, permission_name, view_name)
+    def can_access(self, permission_name, view_name, user=None):
+        if not user:
+            user = g.user
+        return utils.can_access(
+            appbuilder.sm, permission_name, view_name, user)
 
-    def all_datasource_access(self):
+    def all_datasource_access(self, user=None):
         return self.can_access(
-            "all_datasource_access", "all_datasource_access")
+            "all_datasource_access", "all_datasource_access", user=user)
 
-    def database_access(self, database):
+    def database_access(self, database, user=None):
         return (
-            self.can_access("all_database_access", "all_database_access") or
-            self.can_access("database_access", database.perm)
+            self.can_access(
+                "all_database_access", "all_database_access", user=user) or
+            self.can_access("database_access", database.perm, user=user)
         )
 
-    def schema_access(self, datasource):
+    def schema_access(self, datasource, user=None):
         return (
-            self.database_access(datasource.database) or
-            self.all_datasource_access() or
-            self.can_access("schema_access", datasource.schema_perm)
+            self.database_access(datasource.database, user=user) or
+            self.all_datasource_access(user=user) or
+            self.can_access("schema_access", datasource.schema_perm, user=user)
         )
 
-    def datasource_access(self, datasource):
+    def datasource_access(self, datasource, user=None):
         return (
-            self.schema_access(datasource) or
-            self.can_access("datasource_access", datasource.perm)
+            self.schema_access(datasource, user=user) or
+            self.can_access("datasource_access", datasource.perm, user=user)
         )
 
     def datasource_access_by_name(
@@ -81,7 +88,7 @@ class BaseSupersetView(BaseView):
             return True
 
         schema_perm = utils.get_schema_perm(database, schema)
-        if schema and utils.can_access(sm, 'schema_access', schema_perm):
+        if schema and utils.can_access(sm, 'schema_access', schema_perm, g.user):
             return True
 
         datasources = SourceRegistry.query_datasources_by_name(
@@ -90,6 +97,24 @@ class BaseSupersetView(BaseView):
             if self.can_access("datasource_access", datasource.perm):
                 return True
         return False
+
+    def datasource_access_by_fullname(
+            self, database, full_table_name, schema):
+        table_name_pieces = full_table_name.split(".")
+        if len(table_name_pieces) == 2:
+            table_schema = table_name_pieces[0]
+            table_name = table_name_pieces[1]
+        else:
+            table_schema = schema
+            table_name = table_name_pieces[0]
+        return self.datasource_access_by_name(
+            database, table_name, schema=table_schema)
+
+    def rejected_datasources(self, sql, database, schema):
+        superset_query = sql_parse.SupersetQuery(sql)
+        return [
+            t for t in superset_query.tables if not
+            self.datasource_access_by_fullname(database, t, schema)]
 
 
 class ListWidgetWithCheckboxes(ListWidget):
@@ -205,7 +230,8 @@ def check_ownership(obj, raise_if_false=True):
 
 def get_user_roles():
     if g.user.is_anonymous():
-        return [appbuilder.sm.find_role('Public')]
+        public_role = config.get('AUTH_ROLE_PUBLIC')
+        return [appbuilder.sm.find_role(public_role)] if public_role else []
     return g.user.roles
 
 
@@ -466,10 +492,12 @@ class SqlMetricInlineView(CompactCRUDMixin, SupersetModelView):  # noqa
     }
 
     def post_add(self, metric):
-        utils.init_metrics_perm(superset, [metric])
+        if metric.is_restricted:
+            security.merge_perm(sm, 'metric_access', metric.get_perm())
 
     def post_update(self, metric):
-        utils.init_metrics_perm(superset, [metric])
+        if metric.is_restricted:
+            security.merge_perm(sm, 'metric_access', metric.get_perm())
 
 appbuilder.add_view_no_menu(SqlMetricInlineView)
 
@@ -642,9 +670,10 @@ class TableModelView(SupersetModelView, DeleteMixin):  # noqa
         'changed_by_', 'changed_on_']
     order_columns = [
         'link', 'database', 'is_featured', 'changed_on_']
-    add_columns = ['table_name', 'database', 'schema']
+    add_columns = ['database', 'schema', 'table_name']
     edit_columns = [
-        'table_name', 'sql', 'is_featured', 'database', 'schema',
+        'table_name', 'sql', 'is_featured', 'filter_select_enabled',
+        'database', 'schema',
         'description', 'owner',
         'main_dttm_col', 'default_endpoint', 'offset', 'cache_timeout']
     show_columns = edit_columns + ['perm']
@@ -672,6 +701,7 @@ class TableModelView(SupersetModelView, DeleteMixin):  # noqa
         'database': _("Database"),
         'changed_on_': _("Last Changed"),
         'is_featured': _("Is Featured"),
+        'filter_select_enabled': _("Enable Filter Select"),
         'schema': _("Schema"),
         'default_endpoint': _("Default Endpoint"),
         'offset': _("Offset"),
@@ -702,7 +732,7 @@ class TableModelView(SupersetModelView, DeleteMixin):  # noqa
 
     def post_add(self, table):
         table.fetch_metadata()
-        security.merge_perm(sm, 'datasource_access', table.perm)
+        security.merge_perm(sm, 'datasource_access', table.get_perm())
         if table.schema:
             security.merge_perm(sm, 'schema_access', table.schema_perm)
 
@@ -1029,8 +1059,8 @@ class DruidDatasourceModelView(SupersetModelView, DeleteMixin):  # noqa
     related_views = [DruidColumnInlineView, DruidMetricInlineView]
     edit_columns = [
         'datasource_name', 'cluster', 'description', 'owner',
-        'is_featured', 'is_hidden', 'default_endpoint', 'offset',
-        'cache_timeout']
+        'is_featured', 'is_hidden', 'filter_select_enabled',
+        'default_endpoint', 'offset', 'cache_timeout']
     add_columns = edit_columns
     show_columns = add_columns + ['perm']
     page_size = 500
@@ -1049,6 +1079,7 @@ class DruidDatasourceModelView(SupersetModelView, DeleteMixin):  # noqa
         'owner': _("Owner"),
         'is_featured': _("Is Featured"),
         'is_hidden': _("Is Hidden"),
+        'filter_select_enabled': _("Enable Filter Select"),
         'default_endpoint': _("Default Endpoint"),
         'offset': _("Time Offset"),
         'cache_timeout': _("Cache Timeout"),
@@ -1069,7 +1100,7 @@ class DruidDatasourceModelView(SupersetModelView, DeleteMixin):  # noqa
 
     def post_add(self, datasource):
         datasource.generate_metrics()
-        security.merge_perm(sm, 'datasource_access', datasource.perm)
+        security.merge_perm(sm, 'datasource_access', datasource.get_perm())
         if datasource.schema:
             security.merge_perm(sm, 'schema_access', datasource.schema_perm)
 
@@ -1094,6 +1125,37 @@ def health():
 @app.route('/ping')
 def ping():
     return "OK"
+
+
+class KV(BaseSupersetView):
+
+    """Used for storing and retrieving key value pairs"""
+
+    @log_this
+    @expose("/store/", methods=['POST'])
+    def store(self):
+        try:
+            value = request.form.get('data')
+            obj = models.KeyValue(value=value)
+            db.session.add(obj)
+            db.session.commit()
+        except Exception as e:
+            return json_error_response(e)
+        return Response(
+            json.dumps({'id': obj.id}),
+            status=200)
+
+    @log_this
+    @expose("/<key_id>/", methods=['GET'])
+    def get_value(self, key_id):
+        kv = None
+        try:
+            kv = db.session.query(models.KeyValue).filter_by(id=key_id).one()
+        except Exception as e:
+            return json_error_response(e)
+        return Response(kv.value, status=200)
+
+appbuilder.add_view_no_menu(KV)
 
 
 class R(BaseSupersetView):
@@ -1279,6 +1341,16 @@ class Superset(BaseSupersetView):
     @has_access
     @expose("/approve")
     def approve(self):
+        def clean_fulfilled_requests(session):
+            for r in session.query(DAR).all():
+                datasource = SourceRegistry.get_datasource(
+                    r.datasource_type, r.datasource_id, session)
+                user = sm.get_user_by_id(r.created_by_fk)
+                if not datasource or \
+                   self.datasource_access(datasource, user):
+                    # datasource doesnot exist anymore
+                    session.delete(r)
+            session.commit()
         datasource_type = request.args.get('datasource_type')
         datasource_id = request.args.get('datasource_id')
         created_by_username = request.args.get('created_by')
@@ -1317,21 +1389,30 @@ class Superset(BaseSupersetView):
             if role_to_grant:
                 role = sm.find_role(role_to_grant)
                 requested_by.roles.append(role)
-                flash(__(
+                msg = __(
                     "%(user)s was granted the role %(role)s that gives access "
                     "to the %(datasource)s",
                     user=requested_by.username,
                     role=role_to_grant,
-                    datasource=datasource.full_name), "info")
+                    datasource=datasource.full_name)
+                utils.notify_user_about_perm_udate(
+                    g.user, requested_by, role, datasource,
+                    'email/role_granted.txt', app.config)
+                flash(msg, "info")
 
             if role_to_extend:
                 perm_view = sm.find_permission_view_menu(
-                    'datasource_access', datasource.perm)
-                sm.add_permission_role(sm.find_role(role_to_extend), perm_view)
-                flash(__("Role %(r)s was extended to provide the access to"
-                         " the datasource %(ds)s",
-                         r=role_to_extend, ds=datasource.full_name), "info")
-
+                    'email/datasource_access', datasource.perm)
+                role = sm.find_role(role_to_extend)
+                sm.add_permission_role(role, perm_view)
+                msg = __("Role %(r)s was extended to provide the access to "
+                         "the datasource %(ds)s", r=role_to_extend,
+                         ds=datasource.full_name)
+                utils.notify_user_about_perm_udate(
+                    g.user, requested_by, role, datasource,
+                    'email/role_extended.txt', app.config)
+                flash(msg, "info")
+            clean_fulfilled_requests(session)
         else:
             flash(__("You have no permission to approve this request"),
                   "danger")
@@ -1364,6 +1445,7 @@ class Superset(BaseSupersetView):
         viz_obj = self.get_viz(slice_id)
         return redirect(viz_obj.get_url(**request.args))
 
+    @log_this
     @has_access_api
     @expose("/explore_json/<datasource_type>/<datasource_id>/")
     def explore_json(self, datasource_type, datasource_id):
@@ -1383,16 +1465,21 @@ class Superset(BaseSupersetView):
                 status=404,
                 mimetype="application/json")
 
-        payload = ""
+        payload = {}
+        status = 200
         try:
-            payload = viz_obj.get_json()
+            payload = viz_obj.get_payload()
         except Exception as e:
             logging.exception(e)
+            status = 500
             return json_error_response(utils.error_msg_from_exception(e))
 
+        if payload.get('status') == QueryStatus.FAILED:
+            status = 500
+
         return Response(
-            payload,
-            status=200,
+            viz_obj.json_dumps(payload),
+            status=status,
             mimetype="application/json")
 
     @expose("/import_dashboards", methods=['GET', 'POST'])
@@ -1403,8 +1490,14 @@ class Superset(BaseSupersetView):
         if request.method == 'POST' and f:
             current_tt = int(time.time())
             data = pickle.load(f)
+            # TODO: import DRUID datasources
             for table in data['datasources']:
-                models.SqlaTable.import_obj(table, import_time=current_tt)
+                if table.type == 'table':
+                    models.SqlaTable.import_obj(table, import_time=current_tt)
+                else:
+                    models.DruidDatasource.import_obj(
+                        table, import_time=current_tt)
+            db.session.commit()
             for dashboard in data['dashboards']:
                 models.Dashboard.import_obj(
                     dashboard, import_time=current_tt)
@@ -1419,6 +1512,8 @@ class Superset(BaseSupersetView):
         viz_type = request.args.get("viz_type")
         slice_id = request.args.get('slice_id')
         slc = None
+        user_id = g.user.get_id() if g.user else None
+
         if slice_id:
             slc = db.session.query(models.Slice).filter_by(id=slice_id).first()
 
@@ -1464,6 +1559,10 @@ class Superset(BaseSupersetView):
             return self.save_or_overwrite_slice(
                 request.args, slc, slice_add_perm, slice_edit_perm)
 
+        # find out if user is in explore v2 beta group
+        # and set flag `is_in_explore_v2_beta`
+        is_in_explore_v2_beta = sm.find_role('explore-v2-beta') in get_user_roles()
+
         # handle different endpoints
         if request.args.get("csv") == "true":
             payload = viz_obj.get_csv()
@@ -1474,7 +1573,7 @@ class Superset(BaseSupersetView):
                 mimetype="application/csv")
         elif request.args.get("standalone") == "true":
             return self.render_template("superset/standalone.html", viz=viz_obj, standalone_mode=True)
-        elif request.args.get("V2") == "true":
+        elif request.args.get("V2") == "true" or is_in_explore_v2_beta:
             # bootstrap data for explore V2
             bootstrap_data = {
                 "can_add": slice_add_perm,
@@ -1485,8 +1584,9 @@ class Superset(BaseSupersetView):
                 "datasource_id": datasource_id,
                 "datasource_name": viz_obj.datasource.name,
                 "datasource_type": datasource_type,
-                "user_id": g.user.get_id() if g.user else None,
-                "viz": json.loads(viz_obj.get_json())
+                "user_id": user_id,
+                "viz": json.loads(viz_obj.json_data),
+                "filter_select": viz_obj.datasource.filter_select_enabled
             }
             table_name = viz_obj.datasource.table_name \
                 if datasource_type == 'table' \
@@ -1504,6 +1604,53 @@ class Superset(BaseSupersetView):
                 can_download=slice_download_perm,
                 userid=g.user.get_id() if g.user else ''
             )
+
+    @api
+    @has_access_api
+    @expose("/filter/<datasource_type>/<datasource_id>/<column>/")
+    def filter(self, datasource_type, datasource_id, column):
+        """
+        Endpoint to retrieve values for specified column.
+
+        :param datasource_type: Type of datasource e.g. table
+        :param datasource_id: Datasource id
+        :param column: Column name to retrieve values for
+        :return:
+        """
+        # TODO: Cache endpoint by user, datasource and column
+        error_redirect = '/slicemodelview/list/'
+        datasource_class = models.SqlaTable \
+            if datasource_type == "table" else models.DruidDatasource
+
+        datasource = db.session.query(
+            datasource_class).filter_by(id=datasource_id).first()
+
+        if not datasource:
+            flash(DATASOURCE_MISSING_ERR, "alert")
+            return json_error_response(DATASOURCE_MISSING_ERR)
+        if not self.datasource_access(datasource):
+            flash(get_datasource_access_error_msg(datasource.name), "danger")
+            return json_error_response(DATASOURCE_ACCESS_ERR)
+
+        viz_type = request.args.get("viz_type")
+        if not viz_type and datasource.default_endpoint:
+            return redirect(datasource.default_endpoint)
+        if not viz_type:
+            viz_type = "table"
+        try:
+            obj = viz.viz_types[viz_type](
+                datasource,
+                form_data=request.args,
+                slice_=None)
+        except Exception as e:
+            flash(str(e), "danger")
+            return redirect(error_redirect)
+        status = 200
+        payload = obj.get_values_for_column(column)
+        return Response(
+            payload,
+            status=status,
+            mimetype="application/json")
 
     def save_or_overwrite_slice(
             self, args, slc, slice_add_perm, slice_edit_perm):
@@ -1530,7 +1677,8 @@ class Superset(BaseSupersetView):
         datasource_id = args.get('datasource_id')
 
         if action in ('saveas'):
-            d.pop('slice_id')  # don't save old slice_id
+            if 'slice_id' in d:
+                d.pop('slice_id')  # don't save old slice_id
             slc = models.Slice(owners=[g.user] if g.user else [])
 
         slc.params = json.dumps(d, indent=4, sort_keys=True)
@@ -1672,7 +1820,7 @@ class Superset(BaseSupersetView):
         )
         tables = [t for t in database.all_table_names(schema) if
                   self.datasource_access_by_name(database, t, schema=schema)]
-        views = [v for v in database.all_table_names(schema) if
+        views = [v for v in database.all_view_names(schema) if
                  self.datasource_access_by_name(database, v, schema=schema)]
         payload = {'tables': tables, 'views': views}
         return Response(
@@ -2001,7 +2149,7 @@ class Superset(BaseSupersetView):
                     models.SqlaTable.table_name == table_name)
             ).first()
             if not table:
-                json_error_response(__(
+                return json_error_response(__(
                     "Table %(t)s wasn't found in the database %(d)s",
                     t=table_name, s=db_name), status=404)
             slices = session.query(models.Slice).filter_by(
@@ -2147,10 +2295,10 @@ class Superset(BaseSupersetView):
         return Response(status=201)
 
     @has_access
-    @expose("/sqllab_viz/")
+    @expose("/sqllab_viz/", methods=['POST'])
     @log_this
     def sqllab_viz(self):
-        data = json.loads(request.args.get('data'))
+        data = json.loads(request.form.get('data'))
         table_name = data.get('datasourceName')
         viz_type = data.get('chartType')
         table = (
@@ -2161,7 +2309,8 @@ class Superset(BaseSupersetView):
         if not table:
             table = models.SqlaTable(table_name=table_name)
         table.database_id = data.get('dbId')
-        table.sql = data.get('sql')
+        q = SupersetQuery(data.get('sql'))
+        table.sql = q.stripped()
         db.session.add(table)
         cols = []
         dims = []
@@ -2179,10 +2328,17 @@ class Superset(BaseSupersetView):
                 dims.append(col)
             agg = config.get('agg')
             if agg:
-                metrics.append(models.SqlMetric(
-                    metric_name="{agg}__{column_name}".format(**locals()),
-                    expression="{agg}({column_name})".format(**locals()),
-                ))
+                if agg == 'count_distinct':
+                    metrics.append(models.SqlMetric(
+                        metric_name="{agg}__{column_name}".format(**locals()),
+                        expression="COUNT(DISTINCT {column_name})"
+                        .format(**locals()),
+                    ))
+                else:
+                    metrics.append(models.SqlMetric(
+                        metric_name="{agg}__{column_name}".format(**locals()),
+                        expression="{agg}({column_name})".format(**locals()),
+                    ))
         if not metrics:
             metrics.append(models.SqlMetric(
                 metric_name="count".format(**locals()),
@@ -2193,15 +2349,14 @@ class Superset(BaseSupersetView):
         db.session.commit()
         params = {
             'viz_type': viz_type,
-            'groupby': dims[0].column_name if dims else '',
-            'metrics': metrics[0].metric_name if metrics else '',
-            'metric': metrics[0].metric_name if metrics else '',
+            'groupby': dims[0].column_name if dims else None,
+            'metrics': metrics[0].metric_name if metrics else None,
+            'metric': metrics[0].metric_name if metrics else None,
             'since': '100 years ago',
             'limit': '0',
         }
-        params = "&".join([k + '=' + v for k, v in params.items()])
-        url = '/superset/explore/table/{table.id}/?{params}'.format(**locals())
-        return redirect(url)
+        params = "&".join([k + '=' + v for k, v in params.items() if v])
+        return '/superset/explore/table/{table.id}/?{params}'.format(**locals())
 
     @has_access
     @expose("/table/<database_id>/<table_name>/<schema>/")
@@ -2311,20 +2466,24 @@ class Superset(BaseSupersetView):
     @log_this
     def results(self, key):
         """Serves a key off of the results backend"""
+        if not results_backend:
+            return json_error_response("Results backend isn't configured")
+
         blob = results_backend.get(key)
         if blob:
-            json_payload = zlib.decompress(blob)
-            obj = json.loads(json_payload)
-            db_id = obj['query']['dbId']
-            session = db.session()
-            mydb = session.query(models.Database).filter_by(id=db_id).one()
-
-            if not self.database_access(mydb):
-                json_error_response(
-                    get_database_access_error_msg(mydb.database_name))
+            query = (
+                db.session.query(models.Query)
+                .filter_by(results_key=key)
+                .one()
+            )
+            rejected_tables = self.rejected_datasources(
+                query.sql, query.database, query.schema)
+            if rejected_tables:
+                return json_error_response(get_datasource_access_error_msg(
+                    '{}'.format(rejected_tables)))
 
             return Response(
-                json_payload,
+                zlib.decompress(blob),
                 status=200,
                 mimetype="application/json")
         else:
@@ -2343,20 +2502,10 @@ class Superset(BaseSupersetView):
     @log_this
     def sql_json(self):
         """Runs arbitrary sql and returns and json"""
-        def table_accessible(database, full_table_name, schema_name=None):
-            table_name_pieces = full_table_name.split(".")
-            if len(table_name_pieces) == 2:
-                table_schema = table_name_pieces[0]
-                table_name = table_name_pieces[1]
-            else:
-                table_schema = schema_name
-                table_name = table_name_pieces[0]
-            return self.datasource_access_by_name(
-                database, table_name, schema=table_schema)
-
         async = request.form.get('runAsync') == 'true'
         sql = request.form.get('sql')
         database_id = request.form.get('database_id')
+        schema = request.form.get('schema') or None
 
         session = db.session()
         mydb = session.query(models.Database).filter_by(id=database_id).one()
@@ -2365,17 +2514,19 @@ class Superset(BaseSupersetView):
             json_error_response(
                 'Database with id {} is missing.'.format(database_id))
 
-        superset_query = sql_parse.SupersetQuery(sql)
-        schema = request.form.get('schema')
-        schema = schema if schema else None
-
-        rejected_tables = [
-            t for t in superset_query.tables if not
-            table_accessible(mydb, t, schema_name=schema)]
+        rejected_tables = self.rejected_datasources(sql, mydb, schema)
         if rejected_tables:
-            return json_error_response(
-                get_datasource_access_error_msg('{}'.format(rejected_tables)))
+            return json_error_response(get_datasource_access_error_msg(
+                '{}'.format(rejected_tables)))
         session.commit()
+
+        select_as_cta = request.form.get('select_as_cta') == 'true'
+        tmp_table_name = request.form.get('tmp_table_name')
+        if select_as_cta and mydb.force_ctas_schema:
+            tmp_table_name = '{}.{}'.format(
+                mydb.force_ctas_schema,
+                tmp_table_name
+            )
 
         query = models.Query(
             database_id=int(database_id),
@@ -2387,7 +2538,7 @@ class Superset(BaseSupersetView):
             tab_name=request.form.get('tab'),
             status=QueryStatus.PENDING if async else QueryStatus.RUNNING,
             sql_editor_id=request.form.get('sql_editor_id'),
-            tmp_table_name=request.form.get('tmp_table_name'),
+            tmp_table_name=tmp_table_name,
             user_id=int(g.user.get_id()),
             client_id=request.form.get('client_id'),
         )
@@ -2441,14 +2592,24 @@ class Superset(BaseSupersetView):
             .one()
         )
 
-        if not self.database_access(query.database):
-            flash(get_database_access_error_msg(query.database.database_name))
+        rejected_tables = self.rejected_datasources(
+            query.sql, query.database, query.schema)
+        if rejected_tables:
+            flash(get_datasource_access_error_msg('{}'.format(rejected_tables)))
             return redirect('/')
-
-        sql = query.select_sql or query.sql
-        df = query.database.get_df(sql, query.schema)
-        # TODO(bkyryliuk): add compression=gzip for big files.
-        csv = df.to_csv(index=False, encoding='utf-8')
+        blob = None
+        if results_backend and query.results_key:
+            blob = results_backend.get(query.results_key)
+        if blob:
+            json_payload = zlib.decompress(blob)
+            obj = json.loads(json_payload)
+            df = pd.DataFrame.from_records(obj['data'])
+            csv = df.to_csv(index=False, encoding='utf-8')
+        else:
+            sql = query.select_sql or query.executed_sql
+            df = query.database.get_df(sql, query.schema)
+            # TODO(bkyryliuk): add compression=gzip for big files.
+            csv = df.to_csv(index=False, encoding='utf-8')
         response = Response(csv, mimetype='text/csv')
         response.headers['Content-Disposition'] = (
             'attachment; filename={}.csv'.format(query.name))
@@ -2458,65 +2619,24 @@ class Superset(BaseSupersetView):
     @expose("/fetch_datasource_metadata")
     @log_this
     def fetch_datasource_metadata(self):
-        session = db.session
         datasource_type = request.args.get('datasource_type')
         datasource_class = SourceRegistry.sources[datasource_type]
         datasource = (
-            session.query(datasource_class)
+            db.session.query(datasource_class)
             .filter_by(id=request.args.get('datasource_id'))
             .first()
         )
 
-        datasources = db.session.query(datasource_class).all()
-        datasources = sorted(datasources, key=lambda ds: ds.full_name)
-
         # Check if datasource exists
         if not datasource:
             return json_error_response(DATASOURCE_MISSING_ERR)
+
         # Check permission for datasource
         if not self.datasource_access(datasource):
             return json_error_response(DATASOURCE_ACCESS_ERR)
 
-        gb_cols = [(col, col) for col in datasource.groupby_column_names]
-        all_cols = [(c, c) for c in datasource.column_names]
-        order_by_choices = []
-        for s in sorted(datasource.column_names):
-            order_by_choices.append((json.dumps([s, True]), s + ' [asc]'))
-            order_by_choices.append((json.dumps([s, False]), s + ' [desc]'))
-
-        field_options = {
-            'datasource': [(d.id, d.full_name) for d in datasources],
-            'metrics': datasource.metrics_combo,
-            'order_by_cols': order_by_choices,
-            'metric':  datasource.metrics_combo,
-            'secondary_metric': datasource.metrics_combo,
-            'groupby': gb_cols,
-            'columns': gb_cols,
-            'all_columns': all_cols,
-            'all_columns_x': all_cols,
-            'all_columns_y': all_cols,
-            'timeseries_limit_metric': [('', '')] + datasource.metrics_combo,
-            'series': gb_cols,
-            'entity': gb_cols,
-            'x': datasource.metrics_combo,
-            'y': datasource.metrics_combo,
-            'size': datasource.metrics_combo,
-            'mapbox_label': all_cols,
-            'point_radius': [(c, c) for c in (["Auto"] + datasource.column_names)],
-            'filterable_cols': datasource.filterable_column_names,
-        }
-
-        if (datasource_type == 'table'):
-            grains = datasource.database.grains()
-            grain_choices = []
-            if grains:
-                grain_choices = [(grain.name, grain.name) for grain in grains]
-            field_options['granularity_sqla'] = \
-                [(c, c) for c in datasource.dttm_cols]
-            field_options['time_grain_sqla'] = grain_choices
-
         return Response(
-            json.dumps({'field_options': field_options}),
+            json.dumps(datasource.data),
             mimetype="application/json"
         )
 
@@ -2587,9 +2707,14 @@ class Superset(BaseSupersetView):
         if to_time:
             query = query.filter(models.Query.start_time < int(to_time))
 
-        query_limit = config.get('QUERY_SEARCH_LIMIT', 5000)
-        sql_queries = query.limit(query_limit).all()
-        dict_queries = {q.client_id: q.to_dict() for q in sql_queries}
+        query_limit = config.get('QUERY_SEARCH_LIMIT', 1000)
+        sql_queries = (
+            query.order_by(models.Query.start_time.asc())
+            .limit(query_limit)
+            .all()
+        )
+
+        dict_queries = [q.to_dict() for q in sql_queries]
 
         return Response(
             json.dumps(dict_queries, default=utils.json_int_dttm_ser),
@@ -2638,6 +2763,8 @@ class Superset(BaseSupersetView):
     @expose("/profile/<username>/")
     def profile(self, username):
         """User profile page"""
+        if not username and g.user:
+            username = g.user.username
         user = (
             db.session.query(ab_models.User)
             .filter_by(username=username)

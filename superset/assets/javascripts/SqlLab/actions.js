@@ -85,8 +85,12 @@ export function fetchQueryResults(query) {
       success(results) {
         dispatch(querySuccess(query, results));
       },
-      error() {
-        dispatch(queryFailed(query, 'Failed at retrieving results from the results backend'));
+      error(err) {
+        let msg = 'Failed at retrieving results from the results backend';
+        if (err.responseJSON && err.responseJSON.error) {
+          msg = err.responseJSON.error;
+        }
+        dispatch(queryFailed(query, msg));
       },
     });
   };
@@ -293,4 +297,24 @@ export function removeTable(table) {
 
 export function refreshQueries(alteredQueries) {
   return { type: REFRESH_QUERIES, alteredQueries };
+}
+
+export function popStoredQuery(urlId) {
+  return function (dispatch) {
+    $.ajax({
+      type: 'GET',
+      url: `/kv/${urlId}`,
+      success: (data) => {
+        const newQuery = JSON.parse(data);
+        const queryEditorProps = {
+          title: newQuery.title ? newQuery.title : 'shared query',
+          dbId: newQuery.dbId ? parseInt(newQuery.dbId, 10) : null,
+          schema: newQuery.schema ? newQuery.schema : null,
+          autorun: newQuery.autorun ? newQuery.autorun : false,
+          sql: newQuery.sql ? newQuery.sql : 'SELECT ...',
+        };
+        dispatch(addQueryEditor(queryEditorProps));
+      },
+    });
+  };
 }
