@@ -13,9 +13,16 @@ function calHeatmap(slice) {
   const render = function () {
     d3.json(slice.jsonEndpoint(), function (error, json) {
       const data = json.data;
+      const form = json.form_data;
+      
       if (error !== null) {
         slice.error(error.responseText, error);
         return;
+      }
+
+      const steps = [];
+      for (var e = form.legend_domain_from; e < form.legend_domain_to; e += form.legend_domain_step) {
+        steps.push(e);
       }
 
       div.selectAll('*').remove();
@@ -30,12 +37,13 @@ function calHeatmap(slice) {
           start: data.start,
           data: timestamps,
           itemSelector: slice.selector,
-          tooltip: true,
+          tooltip: false,
           domain: data.domain,
           subDomain: data.subdomain,
           range: data.range,
           browsing: true,
-          legend: [extents[0], extents[0] + step, extents[0] + step * 2, extents[0] + step * 3],
+          legend: steps, //[extents[0], extents[0] + step, extents[0] + step * 2, extents[0] + step * 3],
+          legendColors: [ form.legend_color_range_from, form.legend_color_range_to ]
         });
       } catch (e) {
         slice.error(e);

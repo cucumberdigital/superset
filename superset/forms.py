@@ -400,6 +400,53 @@ class FormFactory(object):
                     "The time unit for each block. Should be a smaller unit than "
                     "domain_granularity. Should be larger or equal to Time Grain")
             }),
+            'legend_domain_from': (IntegerField, {
+                "label": _("Legend domain from"),
+                "default": "10",
+                "description": _("Legend domain lower bound used to calculate steps")
+            }),
+            'legend_domain_to': (IntegerField, {
+                "label": _("Legend domain to"),
+                "default": "100",
+                "description": _("Legend domain upper bound used to calculate steps")
+            }),
+            'legend_domain_step': (IntegerField, {
+                "label": _("Legend domain step"),
+                "default": "10",
+                "description": _("Legend steps between lower and upper bounds")
+            }),
+            'legend_color_range_from': (FreeFormSelectField, {
+                "label": _("Legend color from"),
+                "default": "#dae289",
+                "choices": self.choicify([
+                    "#f4decd",
+                    "#f5e7d8",
+                    "#ecf5e2",
+                    "#fdffbe",
+                    "#eeebf3",
+                    "#ffffff",
+                    "#d2de76",
+                    "#fcffa3",
+                    "#f6fcfd",
+                ]),
+                "description": _("Legend color at lower bound")
+            }),
+            'legend_color_range_to': (FreeFormSelectField, {
+                "label": _("Legend color to"),
+                "default": "#3b6427",
+                "choices": self.choicify([
+                    "#761d15",
+                    "#510d63",
+                    "#305920",
+                    "#232181",
+                    "#840033",
+                    "#000000",
+                    "#51682a",
+                    "#ad001d",
+                    "#12481b",
+                ]),
+                "description": _("Legend color at upper bound")
+            }),
             'link_length': (FreeFormSelectField, {
                 "label": _("Link Length"),
                 "default": "200",
@@ -460,11 +507,11 @@ class FormFactory(object):
                 "label": _("Resample How"),
                 "default": '',
                 "choices": (
-                     ('', ''),
-                     ('mean', _('mean')),
-                     ('sum', _('sum')),
-                     ('median', _('median')),
-                 ),
+                    ('', ''),
+                    ('mean', _('mean')),
+                    ('sum', _('sum')),
+                    ('median', _('median')),
+                ),
                 "description": _("Pandas resample how")
             }),
             'resample_fillmethod': (FreeFormSelectField, {

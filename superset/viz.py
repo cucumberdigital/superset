@@ -479,6 +479,9 @@ class PivotTableViz(BaseViz):
             'columns',
             'metrics',
             'pandas_aggfunc',
+            ('legend_domain_from', 'legend_domain_to'),
+            'legend_domain_step',
+            ('legend_color_range_from', 'legend_color_range_to'),
         )
     },)
 
@@ -514,7 +517,7 @@ class PivotTableViz(BaseViz):
             columns=self.form_data.get('columns'),
             values=self.form_data.get('metrics'),
             aggfunc=self.form_data.get('pandas_aggfunc'),
-            margins=True,
+            #margins=True,
         )
         return df
 
@@ -664,6 +667,9 @@ class CalHeatmapViz(BaseViz):
             'metric',
             'domain_granularity',
             'subdomain_granularity',
+            ('legend_domain_from', 'legend_domain_to'),
+            'legend_domain_step',
+            ('legend_color_range_from', 'legend_color_range_to'),
         ),
     },)
 
